@@ -1,16 +1,12 @@
 # audio/playback.py
 import asyncio
 import numpy as np
-import queue
 import pyaudio
-from aiortc.contrib.media import MediaPlayer, MediaRecorder
 from av import AudioFrame
 from config import Config
 
 class AudioPlayback:
     def __init__(self):
-        self.media_player = None
-        self.playback_queue = asyncio.Queue()
         self.is_playing = False
         self.pyaudio_instance = None
         self.output_stream = None
@@ -30,6 +26,26 @@ class AudioPlayback:
             self.is_playing = True
         except Exception as e:
             print(f"❌ Error initializing playback: {e}")
+    
+    def stop_playback(self):
+        """Stop audio playback and cleanup resources"""
+        if self.is_playing:
+            self.is_playing = False
+            
+            if self.output_stream:
+                try:
+                    self.output_stream.stop_stream()
+                    self.output_stream.close()
+                    print("🔊 Audio output stream closed")
+                except Exception as e:
+                    print(f"⚠️ Error closing audio stream: {e}")
+                    
+            if self.pyaudio_instance:
+                try:
+                    self.pyaudio_instance.terminate()
+                    print("🔊 PyAudio playback terminated")
+                except Exception as e:
+                    print(f"⚠️ Error terminating PyAudio: {e}")
     
     async def play_track(self, track):
         """Play audio from an aiortc audio track"""
@@ -72,57 +88,3 @@ class AudioPlayback:
             print(f"❌ Error playing track: {e}")
         finally:
             print("🔊 Track playback stopped")
-    
-    def play_audio(self, audio_data):
-        """Add audio data to playback queue"""
-        if self.is_playing:
-            print(f"🎵 Queued {len(audio_data)} bytes for playback.")
-            self.playback_queue.put_nowait(audio_data)
-
-    async def process_playback_queue(self, player_track):
-        """Process audio playback queue using aiortc"""
-        if not player_track:
-            await asyncio.sleep(0.01)
-            return
-            
-        while self.is_playing:
-            try:
-                audio_data = await self.playback_queue.get()
-                # Convert to numpy array if needed
-                if isinstance(audio_data, bytes):
-                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                else:
-                    audio_array = audio_data
-                # Ensure it's a 1D array for mono
-                if len(audio_array.shape) > 1:
-                    audio_array = audio_array.flatten()
-
-                # Create an AudioFrame
-                frame = AudioFrame.from_ndarray(
-                    np.reshape(audio_array, (-1, 1)), # Reshape to (samples, channels)
-                    format='s16', 
-                    layout='mono'
-                )
-                frame.sample_rate = Config.SAMPLE_RATE
-                frame.pts = None # Let aiortc handle pts
-
-                await player_track.send(frame)
-                # print(f"   -> Sent audio frame to player track.")
-                self.playback_queue.task_done()
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                print(f"❌ Error in playback processing: {e}")
-                # Let's not break the loop for a single error
-                await asyncio.sleep(0.01)
-    
-    def stop_playback(self):
-        """Stop audio playback"""
-        self.is_playing = False
-        if self.output_stream:
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-        if self.pyaudio_instance:
-            self.pyaudio_instance.terminate()
-        print("🔊 Playback stopped")

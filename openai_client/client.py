@@ -10,10 +10,11 @@ from audio.playback import AudioPlayback
 # Conversation state variables
 waiting_for_reply = False   # assistant is formulating / speaking
 commit_received = False     # last VAD commit received, not yet queued
+user_transcript = ""        # Store user's transcribed speech
 
 # Constants
-MUTE_GRACE = 0.25    # seconds - let last speaker frames drain
-VAD_WATCHDOG = 1.0   # seconds - force reply if server VAD is silent
+MUTE_GRACE = 0.1    # seconds - shorter grace period
+VAD_WATCHDOG = 2.0   # seconds - longer watchdog to give VAD more time
 
 def prefer_audio_codec(pc, codec_name):
     """Prefer a specific audio codec for WebRTC connection"""
@@ -45,14 +46,25 @@ def prefer_audio_codec(pc, codec_name):
     except Exception as e:
         print(f"⚠️ Could not set codec preference: {e}")
 
+def check_missed_turn(mic_track, events_channel):
+    """Fallback: force response if VAD never fires"""
+    global waiting_for_reply, commit_received
+    
+    print("⚠️ VAD timeout - forcing response.create (this means OpenAI didn't detect your speech)")
+    if events_channel and events_channel.readyState == "open" and not waiting_for_reply:
+        events_channel.send(json.dumps({"type": "response.create"}))
+        waiting_for_reply = True
+        commit_received = False
+
 async def handle_push_to_talk(mic_track, events_channel):
     """Handle push-to-talk functionality with spacebar"""
-    global waiting_for_reply, commit_received
+    global waiting_for_reply, commit_received, user_transcript
     
     loop = asyncio.get_running_loop()
     space_was_down = False
     mute_timer = None
     watchdog = None
+    speech_start_time = None
 
     print("🎹 Push-to-talk ready! Press and hold SPACE to speak.")
     
@@ -70,17 +82,27 @@ async def handle_push_to_talk(mic_track, events_channel):
                     watchdog.cancel()
                     watchdog = None
 
-                if not waiting_for_reply and mic_track.suspended:
+                if not waiting_for_reply:
                     mic_track.suspend(False)
-                    print("🎙️ SPACE pressed → mic unmuted")
+                    speech_start_time = loop.time()
+                    user_transcript = ""  # Reset transcript for new input
+                    print("🎙️ SPACE pressed → Recording your speech...")
+                    print("🎤 Speak now! Release SPACE when done.")
 
             # ── SPACE released (edge) ──────────────────────────────────────
             elif not space_down and space_was_down:
-                if not mic_track.suspended:  # only schedule once
+                if not mic_track.suspended and speech_start_time:  
+                    speech_duration = loop.time() - speech_start_time
+                    print(f"🔇 SPACE released → Speech recorded ({speech_duration:.1f}s)")
+                    
                     def _on_mute():
                         mic_track.suspend(True)
-                        print("🔇 SPACE released → mic muted")
-                        request_answer(mic_track, events_channel)  # normal path
+                        print("🔇 Microphone muted - processing your speech...")
+                        
+                        # Send input_audio_buffer.commit to signal end of input
+                        if events_channel and events_channel.readyState == "open":
+                            events_channel.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            print("📤 Audio buffer committed to OpenAI")
 
                         # start watchdog in case VAD never fires
                         nonlocal watchdog
@@ -89,23 +111,14 @@ async def handle_push_to_talk(mic_track, events_channel):
                         )
 
                     mute_timer = loop.call_later(MUTE_GRACE, _on_mute)
+                    speech_start_time = None
 
             space_was_down = space_down
-            await asyncio.sleep(0.02)  # 20 ms poll
-
+            await asyncio.sleep(0.05)  # Check every 50ms
+            
         except Exception as e:
             print(f"⚠️ Push-to-talk error: {e}")
             await asyncio.sleep(0.1)
-
-def check_missed_turn(mic_track, events_channel):
-    """Force a response if server VAD never committed the turn."""
-    global waiting_for_reply, commit_received
-    
-    if mic_track.suspended and not waiting_for_reply and not commit_received:
-        print("⚠️ No VAD commit within 1s - forcing response.create")
-        if events_channel and events_channel.readyState == "open":
-            events_channel.send(json.dumps({"type": "response.create"}))
-            waiting_for_reply = True
 
 def request_answer(mic_track, events_channel):
     """
@@ -150,16 +163,16 @@ class OpenAIRealtimeClient:
                 json={
                     "model": Config.OPENAI_MODEL,
                     "voice": Config.OPENAI_VOICE,
-                    "instructions": "You are a helpful assistant.",
+                    "instructions": "You are a helpful assistant. Keep responses concise and natural.",
                     "input_audio_transcription": {
                         "model": "whisper-1"
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.9,
+                        "threshold": 0.5,  # Lower threshold for better detection
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 500,
-                        "create_response": False  # Match reference code
+                        "silence_duration_ms": 800,  # Longer silence before committing
+                        "create_response": False
                     }
                 },
                 timeout=20,
@@ -210,13 +223,13 @@ class OpenAIRealtimeClient:
                     handle_push_to_talk(self.mic_track, self.events_channel)
                 )
                 
-                # Send initial greeting
+                # Send initial greeting to start conversation
                 self.events_channel.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message", 
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "Hello! Ready to start voice conversation."}]
+                        "content": [{"type": "input_text", "text": "Hello! I'm ready to have a voice conversation with you."}]
                     }
                 }))
                 self.events_channel.send(json.dumps({"type": "response.create"}))
@@ -286,7 +299,7 @@ class OpenAIRealtimeClient:
 
     def _handle_event(self, message):
         """Handle events from OpenAI"""
-        global waiting_for_reply, commit_received
+        global waiting_for_reply, commit_received, user_transcript
         
         try:
             event = json.loads(message)
@@ -296,30 +309,36 @@ class OpenAIRealtimeClient:
             if event_type == "error":
                 print(f"❌ OpenAI error: {json.dumps(event, indent=2)}")
             elif event_type == "input_audio_buffer.started":
-                print("🎤 OpenAI started receiving audio")
+                print("🎤 OpenAI started receiving your audio")
             elif event_type == "input_audio_buffer.committed":
-                print("✅ Audio buffer committed")
+                print("✅ Your audio was successfully received by OpenAI")
                 commit_received = True
                 request_answer(self.mic_track, self.events_channel)
+            elif event_type == "conversation.item.input_audio_transcription.completed":
+                # This shows what OpenAI heard from the user
+                transcript = event.get("transcript", "")
+                if transcript.strip():
+                    print(f"👤 You said: \"{transcript}\"")
+                    user_transcript = transcript
+                else:
+                    print("👤 (OpenAI detected speech but couldn't transcribe it clearly)")
+            elif event_type == "conversation.item.input_audio_transcription.failed":
+                print("⚠️ OpenAI couldn't transcribe your speech - try speaking more clearly")
             elif event_type == "response.output_item.added":
-                print("💬 Assistant response starting")
+                print("💬 Assistant is preparing response...")
                 # Ensure mic is muted when assistant speaks
                 if self.mic_track:
                     self.mic_track.suspend(True)
             elif event_type == "output_audio_buffer.started":
-                print("🔊 Assistant audio output started")
+                print("🔊 Assistant is speaking...")
             elif event_type == "response.audio_transcript.delta":
-                # Don't print each delta to reduce noise, just show we're receiving
-                if hasattr(self, '_last_transcript_print'):
-                    if not self._last_transcript_print:
-                        print("📝 Receiving audio transcript...")
-                        self._last_transcript_print = True
-                else:
-                    print("📝 Receiving audio transcript...")
-                    self._last_transcript_print = True
+                # Don't print each delta to reduce noise
+                if not hasattr(self, '_receiving_transcript'):
+                    print("📝 Receiving assistant response...")
+                    self._receiving_transcript = True
             elif event_type == "response.audio_transcript.done":
-                print("📝 Audio transcript complete")
-                self._last_transcript_print = False
+                print("📝 Assistant response complete")
+                self._receiving_transcript = False
             elif event_type == "response.done":
                 print("✅ Response generation complete")
             elif event_type == "output_audio_buffer.stopped":
@@ -327,7 +346,7 @@ class OpenAIRealtimeClient:
                 # Reset conversation state
                 waiting_for_reply = False
                 commit_received = False
-                print("🎙️ Ready for your next input (press SPACE to speak)")
+                print("🎙️ Ready for your next input (press and hold SPACE to speak)")
                 
         except Exception as e:
             print(f"⚠️ Error handling event: {e}")

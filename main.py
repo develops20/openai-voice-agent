@@ -2,6 +2,7 @@
 import asyncio
 import signal
 import sys
+import traceback
 from audio.capture import AudioCapture
 from openai_client.client import OpenAIRealtimeClient
 from config import Config
@@ -67,6 +68,9 @@ class VoiceAgent:
     
     async def stop(self):
         """Gracefully stop the voice agent and all its components."""
+        print("🚨 DEBUG: VoiceAgent.stop() called - printing stack trace:")
+        traceback.print_stack()
+        
         # Check is_running to prevent stop from being called multiple times.
         if self.is_running:
             print("\n🛑 Stopping Voice Agent...")
@@ -113,7 +117,7 @@ async def main():
 
 if __name__ == "__main__":
     # asyncio.run() creates and manages the event loop.
-    # The main() coroutine now handles its own exceptions for a clean shutdown.
+    # The main() coroutine now handles its own exception for a clean shutdown.
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
