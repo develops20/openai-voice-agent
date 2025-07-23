@@ -1,6 +1,8 @@
 # Python virtual environment
 venv/
 /venv/
+logs/
+/logs/
 
 # Environment variables
 .env

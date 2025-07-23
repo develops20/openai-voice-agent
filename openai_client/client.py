@@ -6,15 +6,50 @@ import keyboard
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from config import Config
 from audio.playback import AudioPlayback
+import os
+import logging
+from datetime import datetime
+
+# Set up logging for OpenAI voice session
+LOG_DIR = "logs"
+LOG_FILE = "openai_voice_session.log"
+
+# Create logs directory if it doesn't exist
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Set up file logger
+log_file_path = os.path.join(LOG_DIR, LOG_FILE)
+file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# Create formatter
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+# Create logger
+session_logger = logging.getLogger('openai_voice_session')
+session_logger.setLevel(logging.INFO)
+session_logger.addHandler(file_handler)
+
+# Prevent duplicate logs
+session_logger.propagate = False
+
+# Log session start
+session_logger.info("=" * 60)
+session_logger.info("NEW VOICE SESSION STARTED")
+session_logger.info("=" * 60)
 
 # Conversation state variables
-waiting_for_reply = False   # assistant is formulating / speaking
-commit_received = False     # last VAD commit received, not yet queued
-user_transcript = ""        # Store user's transcribed speech
+waiting_for_reply = False
+commit_received = False
+user_transcript = ""
 
-# Constants
-MUTE_GRACE = 0.1    # seconds - shorter grace period
-VAD_WATCHDOG = 2.0   # seconds - longer watchdog to give VAD more time
+# Push-to-talk timing constants
+MUTE_GRACE = 0.1  # seconds to wait before muting after release
+VAD_WATCHDOG = 3.0  # seconds to wait for VAD before assuming it missed the audio
+
+# Additional state for mute timing
+mute_grace_start = None
 
 def prefer_audio_codec(pc, codec_name):
     """Prefer a specific audio codec for WebRTC connection"""
@@ -47,14 +82,17 @@ def prefer_audio_codec(pc, codec_name):
         print(f"⚠️ Could not set codec preference: {e}")
 
 def check_missed_turn(mic_track, events_channel):
-    """Fallback: force response if VAD never fires"""
+    """Check if VAD missed the audio and push-to-talk needs to force a response"""
     global waiting_for_reply, commit_received
     
-    print("⚠️ VAD timeout - forcing response.create (this means OpenAI didn't detect your speech)")
-    if events_channel and events_channel.readyState == "open" and not waiting_for_reply:
-        events_channel.send(json.dumps({"type": "response.create"}))
-        waiting_for_reply = True
-        commit_received = False
+    # Only intervene if we're still waiting and nothing has happened
+    if commit_received and not waiting_for_reply:
+        print("⚠️ VAD timeout - forcing response.create (OpenAI didn't detect speech automatically)")
+        session_logger.warning("VAD: Timeout occurred - forcing response.create")
+        request_answer(mic_track, events_channel)
+    else:
+        # Audio was already processed successfully, no need to intervene
+        session_logger.info("VAD: Timeout occurred but audio was already processed successfully")
 
 async def handle_push_to_talk(mic_track, events_channel):
     """Handle push-to-talk functionality with spacebar"""
@@ -65,13 +103,14 @@ async def handle_push_to_talk(mic_track, events_channel):
     mute_timer = None
     watchdog = None
     speech_start_time = None
-
+    
     print("🎹 Push-to-talk ready! Press and hold SPACE to speak.")
+    session_logger.info("SYSTEM: Push-to-talk ready")
     
     while True:
         try:
             space_down = keyboard.is_pressed("space")
-
+            
             # ── SPACE pressed (edge) ───────────────────────────────────────
             if space_down and not space_was_down:
                 # Cancel pending timers (user resumed speaking)
@@ -88,12 +127,14 @@ async def handle_push_to_talk(mic_track, events_channel):
                     user_transcript = ""  # Reset transcript for new input
                     print("🎙️ SPACE pressed → Recording your speech...")
                     print("🎤 Speak now! Release SPACE when done.")
+                    session_logger.info("USER_INPUT: Started speaking (spacebar pressed)")
 
             # ── SPACE released (edge) ──────────────────────────────────────
             elif not space_down and space_was_down:
                 if not mic_track.suspended and speech_start_time:  
                     speech_duration = loop.time() - speech_start_time
                     print(f"🔇 SPACE released → Speech recorded ({speech_duration:.1f}s)")
+                    session_logger.info(f"USER_INPUT: Stopped speaking (spacebar released) - Duration: {speech_duration:.1f}s")
                     
                     def _on_mute():
                         mic_track.suspend(True)
@@ -103,8 +144,9 @@ async def handle_push_to_talk(mic_track, events_channel):
                         if events_channel and events_channel.readyState == "open":
                             events_channel.send(json.dumps({"type": "input_audio_buffer.commit"}))
                             print("📤 Audio buffer committed to OpenAI")
+                            session_logger.info("USER_INPUT: Audio buffer committed to OpenAI")
 
-                        # start watchdog in case VAD never fires
+                        # Start watchdog in case VAD doesn't process the audio
                         nonlocal watchdog
                         watchdog = loop.call_later(
                             VAD_WATCHDOG, check_missed_turn, mic_track, events_channel
@@ -117,13 +159,15 @@ async def handle_push_to_talk(mic_track, events_channel):
             await asyncio.sleep(0.05)  # Check every 50ms
             
         except Exception as e:
-            print(f"⚠️ Push-to-talk error: {e}")
+            error_msg = f"Push-to-talk error: {e}"
+            print(f"⚠️ {error_msg}")
+            session_logger.error(f"PUSH_TO_TALK: {error_msg}")
             await asyncio.sleep(0.1)
 
 def request_answer(mic_track, events_channel):
     """
     Fire 'response.create' once both:
-      • server finished VAD (commit_received)
+      • audio buffer committed (commit_received)
       • mic is muted (user released SPACE)
     """
     global waiting_for_reply, commit_received
@@ -152,6 +196,7 @@ class OpenAIRealtimeClient:
     async def create_session(self):
         """Step 1: Create session with OpenAI API to get credentials"""
         print("📞 Creating OpenAI Realtime session...")
+        session_logger.info("SESSION: Creating OpenAI Realtime session")
         
         try:
             response = requests.post(
@@ -169,17 +214,21 @@ class OpenAIRealtimeClient:
                     },
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,  # Lower threshold for better detection
+                        "threshold": 0.5,
                         "prefix_padding_ms": 300,
-                        "silence_duration_ms": 800,  # Longer silence before committing
-                        "create_response": False
-                    }
+                        "silence_duration_ms": 2000,  # Longer silence to reduce interference with push-to-talk
+                        "create_response": False  # Don't auto-create responses - let push-to-talk handle it
+                    },
+                    "input_audio_format": "g711_ulaw",  # PCMU format for WebRTC compatibility  
+                    "output_audio_format": "g711_ulaw"  # PCMU format for WebRTC compatibility
                 },
                 timeout=20,
             )
             
             if response.status_code not in [200, 201]:
-                print(f"❌ Failed to create session: {response.status_code} {response.text}")
+                error_msg = f"Failed to create session: {response.status_code} {response.text}"
+                print(f"❌ {error_msg}")
+                session_logger.error(f"SESSION: {error_msg}")
                 return False
                 
             session_data = response.json()
@@ -188,10 +237,15 @@ class OpenAIRealtimeClient:
             
             print("✅ OpenAI session created successfully")
             print(f"🆔 Session ID: {self.session_id}")
+            
+            session_logger.info(f"SESSION: Created successfully - ID: {self.session_id}")
+            session_logger.info(f"SESSION_RESPONSE: {json.dumps(session_data, indent=2)}")
             return True
             
         except Exception as e:
-            print(f"❌ Error creating session: {e}")
+            error_msg = f"Error creating session: {e}"
+            print(f"❌ {error_msg}")
+            session_logger.error(f"SESSION: {error_msg}")
             return False
 
     async def connect(self, microphone_track):
@@ -304,49 +358,84 @@ class OpenAIRealtimeClient:
         try:
             event = json.loads(message)
             event_type = event.get("type", "")
-            print(f"📨 Event: {event_type}")
+            
+            # Log all events to file
+            session_logger.info(f"EVENT: {event_type}")
+            session_logger.info(f"EVENT_DATA: {json.dumps(event, indent=2)}")
+            
+            # Reduce noise from repetitive events
+            if event_type in ["response.audio_transcript.delta", "conversation.item.input_audio_transcription.delta"]:
+                # Don't log these repetitive events individually
+                pass
+            else:
+                print(f"📨 Event: {event_type}")
             
             if event_type == "error":
-                print(f"❌ OpenAI error: {json.dumps(event, indent=2)}")
+                error_msg = f"OpenAI error: {json.dumps(event, indent=2)}"
+                print(f"❌ {error_msg}")
+                session_logger.error(error_msg)
             elif event_type == "input_audio_buffer.started":
-                print("🎤 OpenAI started receiving your audio")
+                msg = "OpenAI started receiving your audio"
+                print(f"🎤 {msg}")
+                session_logger.info(f"AUDIO_INPUT: {msg}")
             elif event_type == "input_audio_buffer.committed":
-                print("✅ Your audio was successfully received by OpenAI")
+                msg = "Your audio was successfully received by OpenAI"
+                print(f"✅ {msg}")
+                session_logger.info(f"AUDIO_INPUT: {msg}")
                 commit_received = True
                 request_answer(self.mic_track, self.events_channel)
             elif event_type == "conversation.item.input_audio_transcription.completed":
                 # This shows what OpenAI heard from the user
                 transcript = event.get("transcript", "")
                 if transcript.strip():
-                    print(f"👤 You said: \"{transcript}\"")
+                    msg = f'You said: "{transcript}"'
+                    print(f"👤 {msg}")
+                    session_logger.info(f"USER_TRANSCRIPT: {transcript}")
                     user_transcript = transcript
                 else:
-                    print("👤 (OpenAI detected speech but couldn't transcribe it clearly)")
+                    msg = "(OpenAI detected speech but couldn't transcribe it clearly)"
+                    print(f"👤 {msg}")
+                    session_logger.warning(f"USER_TRANSCRIPT: Failed to transcribe clearly")
             elif event_type == "conversation.item.input_audio_transcription.failed":
-                print("⚠️ OpenAI couldn't transcribe your speech - try speaking more clearly")
+                msg = "OpenAI couldn't transcribe your speech - try speaking more clearly"
+                print(f"⚠️ {msg}")
+                session_logger.warning(f"USER_TRANSCRIPT: {msg}")
             elif event_type == "response.output_item.added":
-                print("💬 Assistant is preparing response...")
+                msg = "Assistant is preparing response..."
+                print(f"💬 {msg}")
+                session_logger.info(f"ASSISTANT: {msg}")
                 # Ensure mic is muted when assistant speaks
                 if self.mic_track:
                     self.mic_track.suspend(True)
             elif event_type == "output_audio_buffer.started":
-                print("🔊 Assistant is speaking...")
+                msg = "Assistant is speaking..."
+                print(f"🔊 {msg}")
+                session_logger.info(f"ASSISTANT: {msg}")
             elif event_type == "response.audio_transcript.delta":
                 # Don't print each delta to reduce noise
                 if not hasattr(self, '_receiving_transcript'):
                     print("📝 Receiving assistant response...")
+                    session_logger.info("ASSISTANT: Starting to receive response transcript")
                     self._receiving_transcript = True
             elif event_type == "response.audio_transcript.done":
-                print("📝 Assistant response complete")
-                self._receiving_transcript = False
+                msg = "Assistant response complete"
+                print(f"📝 {msg}")
+                session_logger.info(f"ASSISTANT: {msg}")
+                if hasattr(self, '_receiving_transcript'):
+                    del self._receiving_transcript
             elif event_type == "response.done":
-                print("✅ Response generation complete")
+                msg = "Response generation complete"
+                print(f"✅ {msg}")
+                session_logger.info(f"ASSISTANT: {msg}")
             elif event_type == "output_audio_buffer.stopped":
-                print("🏁 Assistant finished speaking")
+                msg = "Assistant finished speaking"
+                print(f"🏁 {msg}")
+                session_logger.info(f"ASSISTANT: {msg}")
                 # Reset conversation state
                 waiting_for_reply = False
                 commit_received = False
                 print("🎙️ Ready for your next input (press and hold SPACE to speak)")
+                session_logger.info("SYSTEM: Ready for next user input")
                 
         except Exception as e:
             print(f"⚠️ Error handling event: {e}")
@@ -367,25 +456,34 @@ class OpenAIRealtimeClient:
 
     async def disconnect(self):
         """Clean up and disconnect"""
+        session_logger.info("SESSION: Disconnecting from OpenAI")
         print("🛑 Disconnecting from OpenAI...")
         
         # Stop push-to-talk handler
-        if self.push_to_talk_task:
+        if hasattr(self, 'push_to_talk_task') and self.push_to_talk_task:
             self.push_to_talk_task.cancel()
             try:
                 await self.push_to_talk_task
             except asyncio.CancelledError:
                 pass
         
-        if self.player_task:
+        if hasattr(self, 'player_task') and self.player_task:
             self.player_task.cancel()
             try:
                 await self.player_task
             except asyncio.CancelledError:
                 pass
                 
-        self.audio_playback.stop_playback()
+        if self.audio_playback:
+            self.audio_playback.stop_playback()
+            session_logger.info("SESSION: Audio playback stopped")
         
         if self.pc:
             await self.pc.close()
             print("🔌 WebRTC connection closed")
+            session_logger.info("SESSION: WebRTC connection closed")
+        
+        session_logger.info("SESSION: Disconnection complete")
+        session_logger.info("=" * 60)
+        session_logger.info("VOICE SESSION ENDED")
+        session_logger.info("=" * 60)

@@ -4,6 +4,7 @@ import numpy as np
 import pyaudio
 from av import AudioFrame
 from config import Config
+from aiortc.mediastreams import MediaStreamError
 
 class AudioPlayback:
     def __init__(self):
@@ -73,7 +74,42 @@ class AudioPlayback:
                         audio_bytes = audio_array.tobytes()
                         self.output_stream.write(audio_bytes)
                         
+                except MediaStreamError:
+                    # Normal end-of-stream - OpenAI finished sending audio
+                    print("✅ Audio stream ended normally")
+                    break
+                    
+                except ConnectionError:
+                    # Connection closed normally - also end-of-stream
+                    print("✅ Audio connection closed normally") 
+                    break
+                    
+                except (OSError, BrokenPipeError, ConnectionResetError):
+                    # Network-related end-of-stream conditions
+                    print("✅ Audio network connection ended normally")
+                    break
+                    
+                except asyncio.TimeoutError:
+                    # Timeout waiting for next frame - normal end
+                    print("✅ Audio stream timeout (normal end)")
+                    break
+                    
+                except StopAsyncIteration:
+                    # Async iterator exhausted - normal end
+                    print("✅ Audio stream iteration complete")
+                    break
+                    
                 except Exception as frame_error:
+                    # Check if it's an end-of-stream related error by message content
+                    error_msg = str(frame_error).lower()
+                    if any(phrase in error_msg for phrase in [
+                        "connection closed", "stream ended", "eof", "end of file", 
+                        "no more data", "stream closed", "track ended"
+                    ]):
+                        print(f"✅ Audio stream ended normally: {frame_error}")
+                        break
+                    
+                    # Real errors - count these toward limit
                     consecutive_errors += 1
                     print(f"⚠️ Audio frame error ({consecutive_errors}/{max_consecutive_errors}): {frame_error}")
                     

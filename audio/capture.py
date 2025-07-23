@@ -26,6 +26,13 @@ class MicrophoneStreamTrack(MediaStreamTrack):
         # Push-to-talk state
         self.suspended = True  # Start suspended (muted)
         self.force_stop = False  # Flag to force stop recording
+        
+        # Timestamp tracking for proper PTS
+        self.samples_sent = 0
+        self.start_time = None
+        
+        # Audio level logging counter
+        self.audio_level_counter = 0
 
     def suspend(self, suspended=True):
         """Suspend or resume the microphone track"""
@@ -111,7 +118,10 @@ class MicrophoneStreamTrack(MediaStreamTrack):
                 audio_data = np.frombuffer(in_data, dtype=np.int16)
                 rms = np.sqrt(np.mean(audio_data.astype(np.float64)**2))
                 normalized_rms = rms / 32768.0
-                if normalized_rms > 0.001:  # Only show when there's actual sound
+                
+                # Log audio level occasionally to reduce spam
+                self.audio_level_counter += 1
+                if normalized_rms > 0.001 and self.audio_level_counter % 8 == 0:  # Every ~1 second at 8kHz
                     print(f"🎤 Live audio level: {normalized_rms:.4f}")
             except Exception as e:
                 print(f"⚠️ Error in audio callback: {e}")
@@ -133,9 +143,6 @@ class MicrophoneStreamTrack(MediaStreamTrack):
         """
         Stops the recording thread and cleans up PyAudio resources.
         """
-        print("🚨 DEBUG: stop() called - printing stack trace:")
-        traceback.print_stack()
-        
         if self.is_recording:
             print("🛑 Stopping audio recording...")
             self.is_recording = False
@@ -156,32 +163,78 @@ class MicrophoneStreamTrack(MediaStreamTrack):
         This method is called by aiortc to get the next audio frame.
         It waits for a new frame to be available in the queue.
         """
-        # Always try to get real audio data first
-        try:
-            data = await asyncio.wait_for(self.frames_queue.get(), timeout=0.02)
-            self.frames_queue.task_done()
-        except asyncio.TimeoutError:
-            # If no real data available, send silence
-            silence_data = np.zeros(Config.CHUNK_SIZE, dtype=np.int16)
-            frame = AudioFrame.from_ndarray(
-                silence_data.reshape(-1, Config.CHANNELS),
-                format='s16', 
-                layout='mono' if Config.CHANNELS == 1 else 'stereo'
-            )
-            frame.sample_rate = Config.SAMPLE_RATE
-            frame.pts = None
-            return frame
+        # Initialize start time on first call
+        if self.start_time is None:
+            import time
+            self.start_time = time.time()
         
-        # Create an AudioFrame from the raw PCM data.
-        frame = AudioFrame.from_ndarray(
-            np.frombuffer(data, dtype=np.int16).reshape(-1, Config.CHANNELS),
-            format='s16', 
-            layout='mono' if Config.CHANNELS == 1 else 'stereo'
-        )
-        frame.sample_rate = Config.SAMPLE_RATE
-        frame.pts = None # Let aiortc handle the presentation timestamp
-
-        return frame
+        try:
+            # Try to get real audio data first
+            try:
+                data = await asyncio.wait_for(self.frames_queue.get(), timeout=0.02)
+                self.frames_queue.task_done()
+                
+                # Create AudioFrame from real data
+                audio_array = np.frombuffer(data, dtype=np.int16)
+                reshaped = audio_array.reshape(Config.CHANNELS, -1)
+                
+                frame = AudioFrame.from_ndarray(
+                    reshaped,
+                    format='s16', 
+                    layout='mono' if Config.CHANNELS == 1 else 'stereo'
+                )
+                frame.sample_rate = Config.SAMPLE_RATE
+                
+                # Set proper timestamp
+                frame.pts = self.samples_sent
+                self.samples_sent += Config.CHUNK_SIZE
+                
+                # Log occasionally to avoid spam - every ~2 seconds when speaking
+                if self.samples_sent % (Config.CHUNK_SIZE * 16) == 0:  # Every ~2 seconds at 8kHz
+                    print(f"🎤 Real audio frame: {Config.CHUNK_SIZE} samples, pts={frame.pts}")
+                return frame
+                
+            except asyncio.TimeoutError:
+                # Send silence frame with proper timestamp
+                silence_data = np.zeros(Config.CHUNK_SIZE, dtype=np.int16)
+                frame = AudioFrame.from_ndarray(
+                    silence_data.reshape(Config.CHANNELS, -1),
+                    format='s16', 
+                    layout='mono' if Config.CHANNELS == 1 else 'stereo'
+                )
+                frame.sample_rate = Config.SAMPLE_RATE
+                
+                # Set proper timestamp
+                frame.pts = self.samples_sent
+                self.samples_sent += Config.CHUNK_SIZE
+                
+                # Only log occasionally to avoid spam
+                if self.samples_sent % (Config.CHUNK_SIZE * 50) == 0:  # Every ~5 seconds at 8kHz
+                    print(f"🔇 Silence frame: pts={frame.pts}")
+                
+                return frame
+                
+        except Exception as e:
+            print(f"❌ Error in recv(): {e}")
+            
+            # Return silence on any exception
+            try:
+                silence_data = np.zeros(Config.CHUNK_SIZE, dtype=np.int16)
+                frame = AudioFrame.from_ndarray(
+                    silence_data.reshape(Config.CHANNELS, -1),
+                    format='s16', 
+                    layout='mono' if Config.CHANNELS == 1 else 'stereo'
+                )
+                frame.sample_rate = Config.SAMPLE_RATE
+                
+                # Set proper timestamp
+                frame.pts = self.samples_sent
+                self.samples_sent += Config.CHUNK_SIZE
+                
+                return frame
+            except Exception as silence_error:
+                print(f"💥 CRITICAL: Cannot create silence frame: {silence_error}")
+                raise
 
 class AudioCapture:
     """
@@ -199,9 +252,6 @@ class AudioCapture:
     
     async def stop_recording(self):
         """Stop recording audio."""
-        print("🚨 DEBUG: stop_recording() called - printing stack trace:")
-        traceback.print_stack()
-        
         if self.track:
             self.track.stop()
             print("🎤 Audio capture track stopped.")
