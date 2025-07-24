@@ -418,6 +418,12 @@ class OpenAIRealtimeClient:
                     session_logger.info("ASSISTANT: Starting to receive response transcript")
                     self._receiving_transcript = True
             elif event_type == "response.audio_transcript.done":
+                # Extract and display the assistant's transcript
+                transcript = event.get("transcript", "")
+                if transcript.strip():
+                    print(f"🤖 Assistant said: \"{transcript}\"")
+                    session_logger.info(f"ASSISTANT_TRANSCRIPT: {transcript}")
+                
                 msg = "Assistant response complete"
                 print(f"📝 {msg}")
                 session_logger.info(f"ASSISTANT: {msg}")
